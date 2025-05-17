@@ -1,82 +1,203 @@
-// config.cpp
-// Implements configuration handling.
 #include "config.h"
-#include "globals.h" // Access to config paths, keys, g_deviceID
-#include "utils.h"   // For GenerateUUIDString, wstring_to_utf8, EnsureDirectoryExists
-#include "log.h"     // For Log
+#include "log.h"     // 用于记录日志
+#include "utils.h"   // 用于字符串转换等
+#include <fstream>
+#include <sstream>   // 用于转换数字到字符串
+#include <algorithm> // 用于 std::transform (转换为小写等)
 
-#include <Windows.h>
-#include <string>
-#include <vector>
-#include <system_error> // For std::error_code, std::system_category
-
-// Loads the DeviceID from the config file or generates a new one if missing/invalid.
-// (InitializeDeviceID - unchanged from previous fix)
-void InitializeDeviceID() {
-    Log("正在初始化设备 ID..."); // "Initializing Device ID..."
-    if (!EnsureDirectoryExists(CONFIG_DIR)) {
-        Log("错误：无法访问或创建配置目录: " + wstring_to_utf8(CONFIG_DIR) + ". 无法初始化设备 ID。"); // "Error: Cannot access or create config directory... Cannot initialize Device ID."
-        g_deviceID = L"CONFIG_DIR_ERROR"; return;
-    }
-    const DWORD bufferSize = 100; wchar_t buffer[bufferSize];
-    DWORD charsRead = GetPrivateProfileStringW(SYSTEM_SECTION, DEVICE_ID_KEY, L"", buffer, bufferSize, CONFIG_PATH.c_str());
-    if (charsRead > 0) {
-        if (wcslen(buffer) == 36) { g_deviceID = buffer; Log("从配置加载设备 ID: " + wstring_to_utf8(g_deviceID)); } // "Device ID loaded from config: "
-        else { Log("警告：在配置中找到的设备 ID 格式无效（长度不是 36）。正在生成新的设备 ID..."); goto GenerateNewID; } // "Warning: Device ID found in config has invalid format (length != 36). Generating new Device ID..."
-    }
-    else {
-        DWORD lastError = GetLastError(); if (lastError != ERROR_SUCCESS) { Log("错误：读取设备 ID 时出错。错误代码: " + std::to_string(lastError) + " (" + std::system_category().message(lastError) + ")"); } // "Error: Failed reading Device ID. Error code: "
-        Log("在配置中未找到设备 ID。正在生成新的设备 ID..."); goto GenerateNewID; // "Device ID not found in config. Generating new Device ID..."
-    } return;
-GenerateNewID:
-    g_deviceID = GenerateUUIDString();
-    if (!g_deviceID.empty()) {
-        if (WritePrivateProfileStringW(SYSTEM_SECTION, DEVICE_ID_KEY, g_deviceID.c_str(), CONFIG_PATH.c_str())) { Log("已生成并保存新的设备 ID: " + wstring_to_utf8(g_deviceID)); } // "New Device ID generated and saved: "
-        else { DWORD lastError = GetLastError(); Log("错误：无法将新的设备 ID 保存到配置文件。错误代码: " + std::to_string(lastError) + " (" + std::system_category().message(lastError) + ")"); } // "Error: Failed to save new Device ID to config file. Error code: "
-    }
-    else { Log("严重错误：生成新的设备 ID 失败。应用程序可能无法正常运行。"); g_deviceID = L"GENERATION_FAILED"; } // "CRITICAL Error: Failed to generate new Device ID. Application might not function correctly."
+Config::Config() {
+    // 构造函数
 }
 
+Config::~Config() {
+    // 析构函数，如果需要，可以在这里自动保存配置
+    // if (!m_filePath.empty()) {
+    //     Save(m_filePath);
+    // }
+}
 
-// Validates essential settings in the configuration file.
-bool ValidateConfig() {
-    Log("正在验证配置文件: " + wstring_to_utf8(CONFIG_PATH)); // "Validating configuration file: "
-    DWORD fileAttr = GetFileAttributesW(CONFIG_PATH.c_str());
-    if (fileAttr == INVALID_FILE_ATTRIBUTES) { Log("配置文件不存在。需要配置。请运行 Configurator.exe。"); return false; } // "Configuration file does not exist. Configuration needed. Please run Configurator.exe."
-    if (fileAttr & FILE_ATTRIBUTE_DIRECTORY) { Log("错误：配置路径是一个目录，而不是文件。"); return false; } // "Error: Configuration path is a directory, not a file."
+bool Config::Load(const std::wstring& filePath) {
+    std::lock_guard<std::mutex> lock(m_mutex); // 保证线程安全
 
-    wchar_t buffer[MAX_URL_LENGTH];
+    m_filePath = filePath;
+    m_data.clear(); // 清除旧数据
 
-    auto checkStringKey = [&](const wchar_t* keyName, const std::wstring& logKeyName) {
-        DWORD result = GetPrivateProfileStringW(APP_SECTION, keyName, L"", buffer, MAX_URL_LENGTH, CONFIG_PATH.c_str());
-        if (result == 0) {
-            DWORD lastError = GetLastError(); if (lastError != ERROR_SUCCESS) { Log("错误：读取配置键 '" + wstring_to_utf8(logKeyName) + "' 时出错。错误代码: " + std::to_string(lastError) + " (" + std::system_category().message(lastError) + ")"); } // "Error: Failed reading config key '...'. Error code: "
-            else { Log("配置键 (" + wstring_to_utf8(logKeyName) + ") 缺失或为空。需要重新配置。"); } return false; // "Config key (...) missing or empty. Re-configuration needed."
-        } return true;
-        };
-    if (!checkStringKey(NEWS_URL_KEY, L"NewsUrl")) return false;
-    if (!checkStringKey(WEATHER_URL_KEY, L"WeatherUrl")) return false;
+    std::wifstream file(filePath);
+    if (!file.is_open()) {
+        LOG_WARNING(L"Config file not found or could not be opened: ", filePath);
+        // 文件不存在是正常情况，可能首次运行，不需要报错，但可以记录一个 Info
+        // LOG_INFO(L"Config file not found, will use default values and create on save: ", filePath);
+        return false; // 或者 true，表示允许使用默认值
+    }
 
-    auto checkIntKey = [&](const wchar_t* keyName, const std::wstring& logKeyName, int minVal, int maxVal) {
-        // <<< FIX lnt-uninitialized-local: Initialize value
-        UINT value = static_cast<UINT>(-1); // Use -1 as sentinel
-        value = GetPrivateProfileIntW(APP_SECTION, keyName, static_cast<UINT>(-1), CONFIG_PATH.c_str());
+    std::wstring line;
+    std::wstring currentSection;
 
-        if (value == static_cast<UINT>(-1)) {
-            wchar_t checkBuffer[10]; DWORD checkResult = GetPrivateProfileStringW(APP_SECTION, keyName, L"__NOT_FOUND__", checkBuffer, 10, CONFIG_PATH.c_str());
-            if (checkResult == 0 || wcscmp(checkBuffer, L"__NOT_FOUND__") == 0) { Log("配置键 (" + wstring_to_utf8(logKeyName) + ") 缺失。需要重新配置。"); return false; } // "Config key (...) missing. Re-configuration needed."
-            Log("配置键 (" + wstring_to_utf8(logKeyName) + ") 包含无效的整数值。需要重新配置。"); return false; // "Config key (...) contains invalid integer value. Re-configuration needed."
+    while (std::getline(file, line)) {
+        line = Trim(line);
+
+        if (line.empty() || line[0] == L'#' || line[0] == L';') { // 跳过空行和注释
+            continue;
         }
-        if (static_cast<int>(value) < minVal || static_cast<int>(value) > maxVal) {
-            Log("配置键 (" + wstring_to_utf8(logKeyName) + ") 的值 (" + std::to_string(value) + ") 超出有效范围 [" + std::to_string(minVal) + "-" + std::to_string(maxVal) + "]。需要重新配置。"); return false; // "Config key (...) value (...) out of valid range [...]. Re-configuration needed."
-        } return true;
-        };
-    if (!checkIntKey(NOON_SHUTDOWN_HOUR_KEY, L"NoonShutdownHour", 0, 23)) return false;
-    if (!checkIntKey(NOON_SHUTDOWN_MINUTE_KEY, L"NoonShutdownMinute", 0, 59)) return false;
-    if (!checkIntKey(EVENING_SHUTDOWN_HOUR_KEY, L"EveningShutdownHour", 0, 23)) return false;
-    if (!checkIntKey(EVENING_SHUTDOWN_MINUTE_KEY, L"EveningShutdownMinute", 0, 59)) return false;
 
-    GetPrivateProfileIntW(SYSTEM_SECTION, RUN_ON_STARTUP_KEY, 0, CONFIG_PATH.c_str());
-    Log("配置文件验证通过。"); // "Configuration file validation passed."
+        if (line[0] == L'[' && line.back() == L']') { // Section
+            currentSection = Trim(line.substr(1, line.length() - 2));
+            // 将节名转换为小写，以便不区分大小写查找 (可选)
+            // std::transform(currentSection.begin(), currentSection.end(), currentSection.begin(), ::towlower);
+        }
+        else { // Key-Value pair
+            size_t delimiterPos = line.find(L'=');
+            if (delimiterPos != std::wstring::npos) {
+                std::wstring key = Trim(line.substr(0, delimiterPos));
+                std::wstring value = Trim(line.substr(delimiterPos + 1));
+
+                // 将键名转换为小写 (可选)
+                // std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+
+                if (!currentSection.empty() && !key.empty()) {
+                    m_data[currentSection][key] = value;
+                }
+                else if (key.empty() && !currentSection.empty()) {
+                    LOG_WARNING(L"Empty key found in section [", currentSection, L"] in config file: ", filePath);
+                }
+                else {
+                    LOG_WARNING(L"Key-value pair found outside of a section or empty key/section: ", line);
+                }
+            }
+            else {
+                LOG_WARNING(L"Malformed line in config file (no '='): ", line);
+            }
+        }
+    }
+
+    file.close();
+    LOG_INFO(L"Configuration loaded from: ", filePath);
     return true;
+}
+
+bool Config::Save(const std::wstring& filePathToSave) {
+    std::lock_guard<std::mutex> lock(m_mutex); // 保证线程安全
+
+    std::wstring targetPath = filePathToSave.empty() ? m_filePath : filePathToSave;
+    if (targetPath.empty()) {
+        LOG_ERROR(L"Cannot save configuration: No file path specified and no previous path loaded.");
+        return false;
+    }
+
+    // 确保目录存在
+    size_t lastSlash = targetPath.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        std::wstring dir = targetPath.substr(0, lastSlash);
+        if (!DirectoryExists(dir)) {
+            if (!CreateDirectoryRecursive(dir)) {
+                LOG_ERROR(L"Failed to create directory for config file: ", dir);
+                return false;
+            }
+        }
+    }
+
+    std::wofstream file(targetPath);
+    if (!file.is_open()) {
+        LOG_ERROR(L"Could not open config file for saving: ", targetPath);
+        return false;
+    }
+
+    for (const auto& sectionPair : m_data) {
+        file << L"[" << sectionPair.first << L"]" << std::endl;
+        for (const auto& keyPair : sectionPair.second) {
+            file << keyPair.first << L" = " << keyPair.second << std::endl;
+        }
+        file << std::endl; // 在节之间添加空行，美观
+    }
+
+    file.close();
+    if (file.fail()) { // 检查关闭后的流状态
+        LOG_ERROR(L"Failed to write or close config file properly: ", targetPath);
+        return false;
+    }
+
+    LOG_INFO(L"Configuration saved to: ", targetPath);
+    // 如果是保存到新路径，更新 m_filePath
+    if (!filePathToSave.empty()) {
+        m_filePath = filePathToSave;
+    }
+    return true;
+}
+
+std::wstring Config::GetString(const std::wstring& section, const std::wstring& key, const std::wstring& defaultValue) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // std::wstring lookupSection = section;
+    // std::wstring lookupKey = key;
+    // std::transform(lookupSection.begin(), lookupSection.end(), lookupSection.begin(), ::towlower); // 如果加载时转了小写
+    // std::transform(lookupKey.begin(), lookupKey.end(), lookupKey.begin(), ::towlower);
+
+    auto itSection = m_data.find(section); // or lookupSection
+    if (itSection != m_data.end()) {
+        auto itKey = itSection->second.find(key); // or lookupKey
+        if (itKey != itSection->second.end()) {
+            return itKey->second;
+        }
+    }
+    return defaultValue;
+}
+
+int Config::GetInt(const std::wstring& section, const std::wstring& key, int defaultValue) const {
+    std::wstring strValue = GetString(section, key, L"");
+    if (strValue.empty()) {
+        return defaultValue;
+    }
+    try {
+        return std::stoi(strValue);
+    }
+    catch (const std::invalid_argument& ia) {
+        LOG_WARNING(L"Invalid integer format for [", section, L"]", key, L" = '", strValue, L"'. Using default value. Error: ", ia.what());
+    }
+    catch (const std::out_of_range& oor) {
+        LOG_WARNING(L"Integer value out of range for [", section, L"]", key, L" = '", strValue, L"'. Using default value. Error: ", oor.what());
+    }
+    return defaultValue;
+}
+
+bool Config::GetBool(const std::wstring& section, const std::wstring& key, bool defaultValue) const {
+    std::wstring strValue = GetString(section, key, L"");
+    if (strValue.empty()) {
+        return defaultValue;
+    }
+    // 将字符串转换为小写以便比较
+    std::transform(strValue.begin(), strValue.end(), strValue.begin(), ::towlower);
+    if (strValue == L"true" || strValue == L"1" || strValue == L"yes" || strValue == L"on") {
+        return true;
+    }
+    if (strValue == L"false" || strValue == L"0" || strValue == L"no" || strValue == L"off") {
+        return false;
+    }
+    LOG_WARNING(L"Invalid boolean format for [", section, L"]", key, L" = '", GetString(section, key, L""), L"'. Using default value.");
+    return defaultValue;
+}
+
+void Config::SetString(const std::wstring& section, const std::wstring& key, const std::wstring& value) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // std::wstring s = section;
+    // std::wstring k = key;
+    // std::transform(s.begin(), s.end(), s.begin(), ::towlower);
+    // std::transform(k.begin(), k.end(), k.begin(), ::towlower);
+    m_data[section][key] = value;
+}
+
+void Config::SetInt(const std::wstring& section, const std::wstring& key, int value) {
+    SetString(section, key, std::to_wstring(value));
+}
+
+void Config::SetBool(const std::wstring& section, const std::wstring& key, bool value) {
+    SetString(section, key, value ? L"true" : L"false");
+}
+
+std::wstring Config::Trim(const std::wstring& str) const {
+    const std::wstring whitespace = L" \t\n\r\f\v";
+    size_t first = str.find_first_not_of(whitespace);
+    if (std::wstring::npos == first) {
+        return L""; // 字符串全是空白
+    }
+    size_t last = str.find_last_not_of(whitespace);
+    return str.substr(first, (last - first + 1));
 }

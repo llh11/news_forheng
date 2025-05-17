@@ -1,36 +1,73 @@
-// ========================================================================
-// utils.h - 包含各种实用函数
-// ========================================================================
-#pragma once
+#ifndef UTILS_H
+#define UTILS_H
 
 #include <string>
 #include <vector>
-#include <Windows.h> // For HWND
+#include <windows.h> // For MAX_PATH, GetModuleFileNameW etc.
 
-// 将 wstring (UTF-16) 转换为 UTF-8 编码的字符串。
-std::string wstring_to_utf8(const std::wstring& wstr);
+/**
+ * @brief 获取当前可执行文件的完整路径。
+ * @return 可执行文件的路径，失败则返回空字符串。
+ */
+std::wstring GetExecutablePath();
 
-// 将 UTF-8 编码的字符串转换为 wstring (UTF-16)。
-std::wstring utf8_to_wstring(const std::string& str);
+/**
+ * @brief 获取当前可执行文件所在的目录。
+ * @return 可执行文件所在目录的路径，失败则返回空字符串。
+ */
+std::wstring GetExecutableDir();
 
-// 常见 JSON 转义序列的基本反转义。
-std::string UnescapeJsonString(const std::string& jsonEscaped);
+/**
+ * @brief 检查目录是否存在。
+ * @param dirPath 目录路径。
+ * @return 如果目录存在则返回 true，否则返回 false。
+ */
+bool DirectoryExists(const std::wstring& dirPath);
 
-// 生成标准 UUID 字符串。
-std::wstring GenerateUUIDString();
+/**
+ * @brief 递归创建目录。
+ * @param dirPath 要创建的目录路径。
+ * @return 如果成功创建或目录已存在则返回 true，否则返回 false。
+ */
+bool CreateDirectoryRecursive(const std::wstring& dirPath);
 
-// 确保指定的目录路径存在，必要时创建它。
-bool EnsureDirectoryExists(const std::wstring& dirPath);
+/**
+ * @brief 将 UTF-8 编码的字符串转换为宽字符串 (wstring)。
+ * @param utf8String UTF-8 字符串。
+ * @return 转换后的宽字符串，失败则返回空字符串。
+ */
+std::wstring Utf8ToWide(const std::string& utf8String);
 
-// 获取 Configurator.exe 可执行文件的完整路径（假设它在同一目录中）。
-std::wstring GetConfiguratorPath();
+/**
+ * @brief 将宽字符串 (wstring) 转换为 UTF-8 编码的字符串。
+ * @param wideString 宽字符串。
+ * @return 转换后的 UTF-8 字符串，失败则返回空字符串。
+ */
+std::string WideToUtf8(const std::wstring& wideString);
 
-// 启动 Configurator.exe 并等待其退出。
-bool LaunchConfiguratorAndWait();
+/**
+ * @brief 替换字符串中所有出现的子串。
+ * @param str 主字符串 (将被修改)。
+ * @param from 要被替换的子串。
+ * @param to 用于替换的子串。
+ */
+void ReplaceAll(std::wstring& str, const std::wstring& from, const std::wstring& to);
 
-// 将版本字符串（例如 "1.2.3"）解析为整数向量。
-std::vector<int> ParseVersion(const std::wstring& versionStr);
+/**
+ * @brief 检查文件是否存在。
+ * @param filePath 文件路径。
+ * @return 如果文件存在则返回 true，否则返回 false。
+ */
+bool FileExists(const std::wstring& filePath);
 
-// 比较两个版本向量 (v1, v2)。如果 v1>v2 返回 >0，如果 v1<v2 返回 <0，如果 v1==v2 返回 0。
-int CompareVersions(const std::vector<int>& v1, const std::vector<int>& v2);
+/**
+ * @brief 读取整个文件的内容到字符串。
+ * @param filePath 文件路径。
+ * @param content 读取到的文件内容 (输出参数)。
+ * @return 如果成功读取则返回 true，否则返回 false。
+ */
+bool ReadFileToString(const std::wstring& filePath, std::string& content); // 读取为 byte string
+bool ReadFileToWString(const std::wstring& filePath, std::wstring& content); // 读取为 wide string (假设文件编码兼容)
 
+
+#endif // UTILS_H

@@ -1,174 +1,257 @@
-// update.cpp
-// Implements the application update process (reading/writing status files, performing update).
-#include "update.h"  // Function declarations for this file
-#include "globals.h" // Access to paths (CONFIG_DIR, PENDING_UPDATE_INFO_PATH, etc.), g_hWnd, g_bRunning, PostMessage
-#include "log.h"     // For Log function
-#include "utils.h"   // For string conversions (wstring_to_utf8, utf8_to_wstring)
-#include "ui.h"      // <<< Added include for PostProgressUpdate
+#include "system_ops.h"
+#include "log.h"
+#include "utils.h" // For GetExecutablePath
+#include "registry.h" // For startup operations
 
-#include <Windows.h>
-#include <fstream>    // For std::wifstream, std::wofstream, std::ifstream, std::ofstream
-#include <sstream>    // For std::wstringstream
-#include <string>
-#include <shellapi.h> // For ShellExecuteW
-#include <vector>     // For std::vector (used in PerformUpdate batch script generation)
-#include <system_error> // For std::system_category
+#include <shellapi.h> // For ShellExecuteExW
+#include <VersionHelpers.h> // For IsWindowsXPOrGreater etc. (if needed, or use RtlGetVersion)
+#include <securitybaseapi.h> // For GetTokenInformation
+#include <processthreadsapi.h> // For OpenProcessToken
 
-// --- Ignored Version File Handling ---
-// (ReadIgnoredVersion - unchanged from previous fix)
-std::wstring ReadIgnoredVersion() {
-    std::wifstream ignoreFile(IGNORED_UPDATE_VERSION_PATH);
-    if (ignoreFile.is_open()) {
-        std::wstring version;
-        if (getline(ignoreFile, version)) {
-            size_t first = version.find_first_not_of(L" \t\n\r");
-            if (first == std::wstring::npos) return L"";
-            size_t last = version.find_last_not_of(L" \t\n\r");
-            return version.substr(first, (last - first + 1));
+namespace SystemOps {
+
+    bool RestartAsAdmin() {
+        wchar_t szPath[MAX_PATH];
+        if (GetModuleFileNameW(NULL, szPath, MAX_PATH) == 0) {
+            LOG_ERROR(L"Failed to get module file name for restart. Error: ", GetLastError());
+            return false;
+        }
+
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpVerb = L"runas"; // 请求管理员权限
+        sei.lpFile = szPath;
+        sei.hwnd = NULL;
+        sei.nShow = SW_NORMAL; // 或者 SW_SHOWNORMAL
+
+        if (!ShellExecuteExW(&sei)) {
+            DWORD dwError = GetLastError();
+            if (dwError == ERROR_CANCELLED) {
+                // 用户取消了 UAC 提示
+                LOG_INFO(L"User cancelled UAC prompt for restart as admin.");
+            }
+            else {
+                LOG_ERROR(L"ShellExecuteExW failed to restart as admin. Error: ", dwError);
+            }
+            return false;
+        }
+        // 如果 ShellExecuteExW 成功，当前进程可以退出了，因为新进程已经启动
+        // PostQuitMessage(0); // or some other way to signal application exit
+        return true;
+    }
+
+    bool IsRunningAsAdmin() {
+        BOOL fIsAdmin = FALSE;
+        HANDLE hToken = NULL;
+        TOKEN_ELEVATION elevation;
+        DWORD dwSize;
+
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            LOG_WARNING(L"Failed to open process token. Error: ", GetLastError());
+            return false; // 不能确定，保守返回 false
+        }
+
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
+            fIsAdmin = elevation.TokenIsElevated;
+        }
+        else {
+            LOG_WARNING(L"Failed to get token elevation information. Error: ", GetLastError());
+            // 在某些情况下 (例如 UAC 关闭)，TokenElevation 可能不可用。
+            // 此时可以尝试检查管理员 SID。
+            // SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+            // PSID pAdminGroup = NULL;
+            // if (AllocateAndInitializeSid(&NtAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &pAdminGroup)) {
+            //     if (!CheckTokenMembership(NULL, pAdminGroup, &fIsAdmin)) {
+            //         fIsAdmin = FALSE; // Failed, assume not admin
+            //     }
+            //     FreeSid(pAdminGroup);
+            // }
+        }
+
+        if (hToken) {
+            CloseHandle(hToken);
+        }
+        return fIsAdmin == TRUE;
+    }
+
+
+    bool ExecuteProcess(
+        const std::wstring& command,
+        const std::wstring& params,
+        const std::wstring& workingDirectory,
+        bool waitForCompletion,
+        PROCESS_INFORMATION* outProcessInfo,
+        bool hidden)
+    {
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        if (hidden) {
+            si.dwFlags |= STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+        }
+        ZeroMemory(&pi, sizeof(pi));
+
+        std::wstring fullCommandLine = L"\"" + command + L"\" " + params;
+        // CreateProcessW 修改命令行参数，所以需要一个可写的 buffer
+        std::vector<wchar_t> cmdLineVec(fullCommandLine.begin(), fullCommandLine.end());
+        cmdLineVec.push_back(L'\0'); // Null-terminate
+
+        const wchar_t* lpWorkingDirectory = workingDirectory.empty() ? NULL : workingDirectory.c_str();
+
+        if (!CreateProcessW(
+            NULL,               // lpApplicationName - use command line to specify executable
+            cmdLineVec.data(),  // lpCommandLine
+            NULL,               // lpProcessAttributes
+            NULL,               // lpThreadAttributes
+            FALSE,              // bInheritHandles
+            hidden ? CREATE_NO_WINDOW : 0, // dwCreationFlags
+            NULL,               // lpEnvironment
+            lpWorkingDirectory, // lpCurrentDirectory
+            &si,                // lpStartupInfo
+            &pi                 // lpProcessInformation
+        ))
+        {
+            LOG_ERROR(L"CreateProcess failed for command: ", command, L" Error: ", GetLastError());
+            return false;
+        }
+
+        LOG_INFO(L"Process created. PID: ", pi.dwProcessId, L" Command: ", command);
+
+        if (outProcessInfo) {
+            *outProcessInfo = pi; // 拷贝句柄等信息
+        }
+
+        if (waitForCompletion) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            // 如果需要获取退出码:
+            // DWORD exitCode = 0;
+            // if (GetExitCodeProcess(pi.hProcess, &exitCode)) {
+            //     LOG_INFO(L"Process ", pi.dwProcessId, L" exited with code: ", exitCode);
+            // }
+        }
+
+        // 如果调用者不需要 PROCESS_INFORMATION (例如 !waitForCompletion && !outProcessInfo)
+        // 或者 waitForCompletion 后，应该关闭句柄
+        if (!outProcessInfo || waitForCompletion) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+        // 如果 outProcessInfo 被填充，调用者负责关闭 pi.hProcess 和 pi.hThread
+
+        return true;
+    }
+
+
+    std::wstring GetErrorMessage(DWORD errorCode) {
+        LPVOID lpMsgBuf = nullptr;
+        FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL,
+            errorCode,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPWSTR)&lpMsgBuf,
+            0, NULL);
+
+        std::wstring message = L"Unknown error";
+        if (lpMsgBuf) {
+            message = (LPWSTR)lpMsgBuf;
+            LocalFree(lpMsgBuf);
+            // 去除末尾的换行符
+            if (!message.empty() && (message.back() == L'\n' || message.back() == L'\r')) {
+                message.pop_back();
+            }
+            if (!message.empty() && (message.back() == L'\n' || message.back() == L'\r')) {
+                message.pop_back();
+            }
+        }
+        return message + L" (Code: " + std::to_wstring(errorCode) + L")";
+    }
+
+    std::wstring GetOSVersion() {
+        // 使用 RtlGetVersion 是获取 OS 版本信息的推荐方式
+        // 需要链接 Ntdll.lib 或者动态加载
+        // typedef LONG (WINAPI *RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+        // RTL_OSVERSIONINFOW osvi = {0};
+        // osvi.dwOSVersionInfoSize = sizeof(osvi);
+        // HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        // if (hNtdll) {
+        //     RtlGetVersionPtr pRtlGetVersion = (RtlGetVersionPtr)GetProcAddress(hNtdll, "RtlGetVersion");
+        //     if (pRtlGetVersion && pRtlGetVersion(&osvi) == 0 /* STATUS_SUCCESS */) {
+        //         std::wstringstream wss;
+        //         wss << L"Windows " << osvi.dwMajorVersion << L"." << osvi.dwMinorVersion
+        //             << L" (Build " << osvi.dwBuildNumber << L")";
+        //         if (osvi.szCSDVersion[0]) {
+        //             wss << L" " << osvi.szCSDVersion;
+        //         }
+        //         return wss.str();
+        //     }
+        // }
+        //
+        // // 回退到 GetVersionEx (不推荐用于 Win8.1 及更高版本，因为可能返回不准确的值，除非有 manifest)
+        // OSVERSIONINFOEXW osviEx;
+        // ZeroMemory(&osviEx, sizeof(OSVERSIONINFOEXW));
+        // osviEx.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEXW);
+        // #pragma warning(suppress : 4996) // 禁用 GetVersionExW 的弃用警告
+        // if (!GetVersionExW((OSVERSIONINFOW*)&osviEx)) {
+        //     return L"Unknown OS (GetVersionEx failed)";
+        // }
+        // std::wstringstream wss;
+        // wss << L"Windows " << osviEx.dwMajorVersion << L"." << osviEx.dwMinorVersion
+        //     << L" (Build " << osviEx.dwBuildNumber << L") SP " << osviEx.wServicePackMajor
+        //     << L"." << osviEx.wServicePackMinor;
+        // return wss.str();
+
+        // 更简单的方式，如果只需要大致判断，可以使用 VersionHelpers.h
+        // 但这不直接返回字符串，而是提供 IsWindowsXYOrGreater 系列函数
+
+        // 暂时返回一个通用提示，实际应用中应实现上述方法之一
+        return L"Windows (Version detection not fully implemented)";
+    }
+
+
+    bool AddToStartup(const std::wstring& appName, const std::wstring& appPath, bool forCurrentUser) {
+        HKEY rootKey = forCurrentUser ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+        std::wstring regPath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+        std::wstring command = L"\"" + appPath + L"\""; // 确保路径用引号括起来，以防有空格
+
+        if (Registry::WriteString(rootKey, regPath, appName, command)) {
+            LOG_INFO(L"Added '", appName, L"' to startup (", (forCurrentUser ? L"Current User" : L"All Users"), L"). Path: ", command);
+            return true;
+        }
+        else {
+            LOG_ERROR(L"Failed to add '", appName, L"' to startup. Ensure correct permissions if for All Users.");
+            return false;
         }
     }
-    return L"";
-}
-// (WriteIgnoredVersion - unchanged from previous fix)
-void WriteIgnoredVersion(const std::wstring& version) {
-    if (version.empty()) { Log("错误：尝试写入空的忽略版本。"); return; } // "Error: Attempting to write empty ignored version."
-    std::wofstream ignoreFile(IGNORED_UPDATE_VERSION_PATH);
-    if (ignoreFile.is_open()) {
-        ignoreFile << version;
-        ignoreFile.close();
-        if (!ignoreFile.good()) { Log("错误：写入忽略版本文件时出错 (" + wstring_to_utf8(IGNORED_UPDATE_VERSION_PATH) + ")。"); } // "Error: Failed writing ignored version file (...)."
-        else { Log("已忽略版本: " + wstring_to_utf8(version)); } // "Ignoring version: "
-    }
-    else { Log("错误：打开忽略版本文件进行写入时出错 (" + wstring_to_utf8(IGNORED_UPDATE_VERSION_PATH) + ")。"); } // "Error: Failed opening ignored version file for writing (...)."
-}
-// (ClearIgnoredVersion - unchanged from previous fix)
-void ClearIgnoredVersion() {
-    if (DeleteFileW(IGNORED_UPDATE_VERSION_PATH.c_str())) { Log("已清除忽略的版本信息。"); } // "Cleared ignored version info."
-    else { DWORD error = GetLastError(); if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) { Log("警告：清除忽略版本文件失败 (" + wstring_to_utf8(IGNORED_UPDATE_VERSION_PATH) + ")。错误代码: " + std::to_string(error)); } } // "Warning: Failed to clear ignored version file (...). Error Code: "
-}
 
-// --- Pending Update Info File Handling ---
-// (SavePendingUpdateInfo - unchanged from previous fix)
-void SavePendingUpdateInfo(const std::wstring& filePath) {
-    if (filePath.empty()) { Log("错误：尝试保存空的待处理更新文件路径。"); return; } // "Error: Attempting to save empty pending update file path."
-    std::ofstream infoFile(PENDING_UPDATE_INFO_PATH, std::ios::binary | std::ios::trunc);
-    if (infoFile.is_open()) {
-        std::string pathUtf8 = wstring_to_utf8(filePath);
-        if (pathUtf8.empty() && !filePath.empty()) { Log("错误：无法将待处理更新路径转换为 UTF-8。"); return; } // "Error: Failed to convert pending update path to UTF-8."
-        infoFile.write(pathUtf8.c_str(), pathUtf8.length());
-        infoFile.close();
-        if (!infoFile.good()) { Log("错误：写入待处理更新信息文件时出错 (" + wstring_to_utf8(PENDING_UPDATE_INFO_PATH) + ")。"); } // "Error: Failed writing pending update info file (...)."
-        else { Log("已保存待处理更新信息，路径: " + pathUtf8); } // "Pending update info saved for path: "
-    }
-    else { Log("错误：打开待处理更新信息文件进行写入时出错 (" + wstring_to_utf8(PENDING_UPDATE_INFO_PATH) + ")。"); } // "Error: Failed opening pending update info file for writing (...)."
-}
-// (ClearPendingUpdateInfo - unchanged from previous fix)
-void ClearPendingUpdateInfo() {
-    if (DeleteFileW(PENDING_UPDATE_INFO_PATH.c_str())) { Log("已清除待处理更新信息文件。"); } // "Cleared pending update info file."
-    else { DWORD error = GetLastError(); if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) { Log("警告：清除待处理更新信息文件失败 (" + wstring_to_utf8(PENDING_UPDATE_INFO_PATH) + ")。错误代码: " + std::to_string(error)); } } // "Warning: Failed to clear pending update info file (...). Error Code: "
-}
-// (CheckAndApplyPendingUpdate - unchanged from previous fix)
-bool CheckAndApplyPendingUpdate() {
-    Log("正在检查待处理更新..."); // "Checking for pending update..."
-    std::ifstream infoFile(PENDING_UPDATE_INFO_PATH, std::ios::binary | std::ios::ate);
-    if (!infoFile.is_open()) { return false; }
-    std::streamsize size = infoFile.tellg();
-    if (size <= 0) { infoFile.close(); Log("待处理更新信息文件为空。正在清除。"); ClearPendingUpdateInfo(); return false; } // "Pending update info file is empty. Clearing."
-    infoFile.seekg(0, std::ios::beg);
-    std::string pathUtf8;
-    try { pathUtf8.resize(static_cast<size_t>(size)); }
-    catch (const std::bad_alloc&) { Log("错误：为待处理更新路径分配内存失败。"); infoFile.close(); ClearPendingUpdateInfo(); return false; } // "Error: Failed to allocate memory for pending update path."
-    if (!infoFile.read(&pathUtf8[0], size)) { infoFile.close(); Log("错误：读取待处理更新信息文件内容失败。正在清除信息。"); ClearPendingUpdateInfo(); return false; } // "Error: Failed to read pending update info file content. Clearing info."
-    infoFile.close();
-    std::wstring downloadedFilePath = utf8_to_wstring(pathUtf8);
-    if (downloadedFilePath.empty() && !pathUtf8.empty()) { Log("错误：无法将待处理更新路径从 UTF-8 转换。正在清除信息。"); ClearPendingUpdateInfo(); return false; } // "Error: Failed to convert pending update path from UTF-8. Clearing info."
-    if (GetFileAttributesW(downloadedFilePath.c_str()) == INVALID_FILE_ATTRIBUTES) { Log("待处理更新引用的文件丢失: " + pathUtf8 + ". 正在清除信息。"); ClearPendingUpdateInfo(); return false; } // "Pending update referenced file is missing: ... Clearing info."
-    Log("检测到待处理更新文件: " + pathUtf8 + ". 正在提示用户。"); // "Pending update file detected: ... Prompting user."
-    std::wstringstream wss; wss << L"先前已下载更新并计划在启动时安装:\n\n" << L"文件: " << downloadedFilePath << L"\n\n" << L"您想现在安装此更新吗？\n" << L"（选择“否”将删除下载的更新文件）"; // "An update was previously downloaded...\n\nFile: ...\n\nInstall now?\n('No' deletes downloaded file)"
-    int userChoice = MessageBoxW(nullptr, wss.str().c_str(), L"应用待处理更新", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND); // "Apply Pending Update"
-    if (userChoice == IDYES) {
-        Log("用户选择“是”以应用待处理更新。"); // "User chose YES to apply pending update."
-        try { PerformUpdate(downloadedFilePath); Log("错误：PerformUpdate 函数返回，表示更新未能启动。"); ClearPendingUpdateInfo(); MessageBoxW(nullptr, L"启动更新过程失败。请重试或手动更新。", L"更新失败", MB_OK | MB_ICONERROR | MB_TOPMOST); return true; } // "Error: PerformUpdate function returned...""Failed to start update process...""Update Failed"
-        catch (const std::exception& e) { Log("执行 PerformUpdate 时发生异常: " + std::string(e.what())); ClearPendingUpdateInfo(); MessageBoxW(nullptr, (L"应用更新时出错: " + utf8_to_wstring(e.what())).c_str(), L"更新失败", MB_OK | MB_ICONERROR | MB_TOPMOST); return true; } // "Exception during PerformUpdate: ...""Error applying update: ...""Update Failed"
-        catch (...) { Log("执行 PerformUpdate 时发生未知异常。"); ClearPendingUpdateInfo(); MessageBoxW(nullptr, L"应用更新时发生未知错误。", L"更新失败", MB_OK | MB_ICONERROR | MB_TOPMOST); return true; } // "Unknown exception during PerformUpdate.""An unknown error occurred...""Update Failed"
-    }
-    else {
-        Log("用户选择“否”以应用待处理更新或对话框失败。正在删除下载的文件和信息。"); // "User chose NO to apply pending update or dialog failed. Deleting downloaded file and info."
-        if (!DeleteFileW(downloadedFilePath.c_str())) { DWORD error = GetLastError(); if (error != ERROR_FILE_NOT_FOUND) { Log("警告：删除待处理更新文件失败 (" + pathUtf8 + ")。错误代码: " + std::to_string(error)); } } // "Warning: Failed to delete pending update file (...). Error Code: "
-        ClearPendingUpdateInfo(); return false;
-    }
-}
+    bool RemoveFromStartup(const std::wstring& appName, bool forCurrentUser) {
+        HKEY rootKey = forCurrentUser ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+        std::wstring regPath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-
-// Performs the application update using a self-deleting batch script.
-void PerformUpdate(const std::wstring& downloadedFilePath) {
-    Log("开始更新过程..."); // "Starting update process..."
-
-    wchar_t currentExePathArr[MAX_PATH] = { 0 };
-    DWORD pathLen = GetModuleFileNameW(nullptr, currentExePathArr, MAX_PATH);
-    if (pathLen == 0 || pathLen == MAX_PATH) {
-        DWORD error = GetLastError();
-        Log("错误：无法获取当前应用程序路径以执行更新。GetModuleFileNameW 失败或路径过长。错误代码: " + std::to_string(error)); // "Error: Cannot get current app path for update. GetModuleFileNameW failed or path too long. Error code: "
-        PostProgressUpdate(g_hProgressDlg, 0, L"更新失败：无法获取当前路径"); // "Update failed: Cannot get current path"
-        return;
-    }
-    std::wstring currentExePath(currentExePathArr);
-    std::wstring currentExeName = currentExePath.substr(currentExePath.find_last_of(L"\\/") + 1);
-    Log("当前应用程序路径: " + wstring_to_utf8(currentExePath)); // "Current app path: "
-    Log("下载的文件路径: " + wstring_to_utf8(downloadedFilePath)); // "Downloaded file path: "
-    std::wstring batFilePath = CONFIG_DIR + L"update_" + std::to_wstring(GetCurrentProcessId()) + L".bat";
-
-    std::ofstream batFile(batFilePath, std::ios::binary | std::ios::trunc);
-    if (!batFile.is_open()) {
-        Log("错误：无法创建更新脚本: " + wstring_to_utf8(batFilePath)); // "Error: Cannot create update script: "
-        PostProgressUpdate(g_hProgressDlg, 0, L"更新失败：无法创建脚本"); // "Update failed: Cannot create script"
-        return;
+        if (Registry::ValueExists(rootKey, regPath, appName)) {
+            if (Registry::DeleteValue(rootKey, regPath, appName)) {
+                LOG_INFO(L"Removed '", appName, L"' from startup (", (forCurrentUser ? L"Current User" : L"All Users"), L").");
+                return true;
+            }
+            else {
+                LOG_ERROR(L"Failed to remove '", appName, L"' from startup. Ensure correct permissions if for All Users.");
+                return false;
+            }
+        }
+        else {
+            LOG_INFO(L"'", appName, L"' not found in startup (", (forCurrentUser ? L"Current User" : L"All Users"), L"). No action taken.");
+            return true; // 值不存在，也算成功移除
+        }
     }
 
-    std::vector<std::string> commands;
-    commands.push_back("@echo off");
-    commands.push_back("chcp 65001 > nul");
-    commands.push_back("echo 更新程序：正在等待旧应用程序关闭..."); // "Updater: Waiting for old application to close..."
-    commands.push_back("timeout /t 4 /nobreak > nul");
-    commands.push_back("echo 更新程序：正在终止旧进程（如果仍在运行）..."); // "Updater: Terminating old process (if still running)..."
-    commands.push_back("taskkill /F /IM \"" + wstring_to_utf8(currentExeName) + "\" > nul 2>&1");
-    commands.push_back("timeout /t 1 /nobreak > nul");
-    commands.push_back("echo 更新程序：正在删除旧文件..."); // "Updater: Deleting old file..."
-    commands.push_back("del \"" + wstring_to_utf8(currentExePath) + "\"");
-    commands.push_back("echo 更新程序：正在将新文件移动到位..."); // "Updater: Moving new file into place..."
-    commands.push_back("move /Y \"" + wstring_to_utf8(downloadedFilePath) + "\" \"" + wstring_to_utf8(currentExePath) + "\"");
-    commands.push_back("echo 更新程序：正在启动更新后的应用程序..."); // "Updater: Starting updated application..."
-    commands.push_back("start \"\" \"" + wstring_to_utf8(currentExePath) + "\"");
-    commands.push_back("echo 更新程序：正在清理更新脚本..."); // "Updater: Cleaning up update script..."
-    commands.push_back("del \"%~f0\"");
-    for (const auto& cmd : commands) { batFile << cmd << "\r\n"; }
-    batFile.close();
-
-    if (!batFile.good()) {
-        Log("错误：写入更新脚本时出错。"); // "Error: Error writing update script."
-        DeleteFileW(batFilePath.c_str());
-        PostProgressUpdate(g_hProgressDlg, 0, L"更新失败：写入脚本错误"); // "Update failed: Error writing script"
-        return;
+    bool IsInStartup(const std::wstring& appName, bool forCurrentUser) {
+        HKEY rootKey = forCurrentUser ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
+        std::wstring regPath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+        return Registry::ValueExists(rootKey, regPath, appName);
     }
 
-    Log("更新脚本已创建: " + wstring_to_utf8(batFilePath)); // "Update script created: "
-    Log("正在启动更新脚本并退出应用程序..."); // "Launching update script and exiting application..."
 
-    PostProgressUpdate(g_hProgressDlg, 100, L"应用更新..."); // "Applying update..."
-    Sleep(100);
-
-    HINSTANCE result = ShellExecuteW(nullptr, L"open", batFilePath.c_str(), nullptr, CONFIG_DIR.c_str(), SW_HIDE);
-
-    if (reinterpret_cast<INT_PTR>(result) > 32) {
-        Log("更新脚本成功启动。应用程序现在将退出。"); // "Update script launched successfully. Application will now exit."
-        g_bRunning = false;
-        if (g_hWnd) { PostMessage(g_hWnd, WM_CLOSE, 0, 0); }
-        else { exit(0); }
-    }
-    else {
-        DWORD error = GetLastError();
-        Log("错误：启动更新脚本失败。ShellExecuteW 结果: " + std::to_string(reinterpret_cast<uintptr_t>(result)) + ", GetLastError: " + std::to_string(error) + " (" + std::system_category().message(error) + ")"); // "Error: Failed to launch update script. ShellExecuteW result: ..., GetLastError: ..."
-        DeleteFileW(batFilePath.c_str());
-        PostProgressUpdate(g_hProgressDlg, 0, L"启动更新脚本失败"); // "Failed to start update script"
-    }
-}
+} // namespace SystemOps

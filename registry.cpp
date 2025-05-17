@@ -1,122 +1,329 @@
-// registry.cpp
-// Implements Windows Registry operations, specifically for startup settings.
-#include "registry.h" // Function declarations for this file
-#include "globals.h"  // Access to global constants (REGISTRY_VALUE_NAME, RUN_REGISTRY_KEY_PATH), RAII class (RegKeyHandle), config path constants
-#include "log.h"      // For Log function
-#include "utils.h"    // For wstring_to_utf8
+#include "registry.h"
+#include "log.h" // 用于记录日志
+#include <shlwapi.h> // For SHDeleteKeyW
 
-#include <Windows.h>
-#include <string>
-#include <system_error> // For std::system_category
+#pragma comment(lib, "Shlwapi.lib") // For SHDeleteKeyW
 
-// Enables or disables the application from running at Windows startup via the Registry.
-// HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
-bool SetStartupRegistry(bool enable) {
-    Log(enable ? "正在启用启动注册表项..." : "正在禁用启动注册表项..."); // "Enabling startup registry entry..." : "Disabling startup registry entry..."
+Registry::Registry() {
+    // 构造函数
+}
 
-    RegKeyHandle hKey; // RAII handle for the registry key
-    HKEY rawHKey = NULL;
+HKEY Registry::OpenKey(HKEY hKeyRoot, const std::wstring& subKey, REGSAM samDesired, bool createIfNotExist) {
+    HKEY hKey = NULL;
+    LSTATUS status;
 
-    // Open the Run key under HKEY_CURRENT_USER with write access
-    LSTATUS status = RegOpenKeyExW(
-        HKEY_CURRENT_USER,        // Root key
-        RUN_REGISTRY_KEY_PATH,    // Subkey path
-        0,                        // Reserved, must be zero
-        KEY_WRITE,                // Desired access (write for setting/deleting value)
-        &rawHKey                  // Pointer to receive the opened key handle
-    );
-
-    if (status != ERROR_SUCCESS) {
-        Log("错误：无法打开注册表 Run 键。RegOpenKeyExW 失败。错误代码: " + std::to_string(status) + " (" + std::system_category().message(status) + ")"); // "Error: Cannot open Registry Run key. RegOpenKeyExW failed. Error code: "
-        return false;
-    }
-    hKey = rawHKey; // Assign to RAII handle
-
-    if (enable) {
-        // Get the full path to the current executable
-        wchar_t exePath[MAX_PATH] = { 0 };
-        DWORD pathLen = GetModuleFileNameW(NULL, exePath, MAX_PATH);
-        if (pathLen == 0 || pathLen == MAX_PATH) {
-            DWORD error = GetLastError();
-            Log("错误：无法获取当前可执行文件路径以设置启动项。GetModuleFileNameW 失败或路径过长。错误代码: " + std::to_string(error)); // "Error: Cannot get current executable path for startup entry. GetModuleFileNameW failed or path too long. Error code: "
-            return false; // Cannot enable without the path
-        }
-
-        // Add quotes around the path in case it contains spaces
-        std::wstring quotedExePath = L"\"";
-        quotedExePath += exePath;
-        quotedExePath += L"\"";
-
-        // Set the registry value
-        // The data is the full quoted path to the executable.
-        status = RegSetValueExW(
-            hKey.get(),               // Handle to the opened key
-            REGISTRY_VALUE_NAME,      // Name of the value to set
-            0,                        // Reserved, must be zero
-            REG_SZ,                   // Type of data (null-terminated string)
-            reinterpret_cast<const BYTE*>(quotedExePath.c_str()), // Pointer to the data (quoted path)
-            static_cast<DWORD>((quotedExePath.length() + 1) * sizeof(wchar_t)) // Size of the data in bytes (including null terminator)
+    if (createIfNotExist) {
+        DWORD dwDisposition;
+        status = RegCreateKeyExW(
+            hKeyRoot,
+            subKey.c_str(),
+            0,          // Reserved
+            NULL,       // Class
+            REG_OPTION_NON_VOLATILE,
+            samDesired,
+            NULL,       // Security Attributes
+            &hKey,
+            &dwDisposition // Receives REG_CREATED_NEW_KEY or REG_OPENED_EXISTING_KEY
         );
-
-        if (status != ERROR_SUCCESS) {
-            Log("错误：无法设置启动注册表值。RegSetValueExW 失败。错误代码: " + std::to_string(status) + " (" + std::system_category().message(status) + ")"); // "Error: Cannot set startup registry value. RegSetValueExW failed. Error code: "
-            return false;
-        }
-        else {
-            Log("启动注册表项已成功启用。值: " + wstring_to_utf8(REGISTRY_VALUE_NAME) + " = " + wstring_to_utf8(quotedExePath)); // "Startup registry entry enabled successfully. Value: ... = ..."
-        }
     }
     else {
-        // Disable: Delete the registry value
-        status = RegDeleteValueW(
-            hKey.get(),           // Handle to the opened key
-            REGISTRY_VALUE_NAME   // Name of the value to delete
+        status = RegOpenKeyExW(
+            hKeyRoot,
+            subKey.c_str(),
+            0, // Options (0 or REG_OPTION_OPEN_LINK)
+            samDesired,
+            &hKey
         );
-
-        if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) {
-            // Log error only if deletion failed for a reason other than "not found"
-            Log("错误：无法删除启动注册表值。RegDeleteValueW 失败。错误代码: " + std::to_string(status) + " (" + std::system_category().message(status) + ")"); // "Error: Cannot delete startup registry value. RegDeleteValueW failed. Error code: "
-            return false;
-        }
-        else {
-            if (status == ERROR_FILE_NOT_FOUND) {
-                Log("启动注册表项未找到（无需禁用）。"); // "Startup registry entry not found (no need to disable)."
-            }
-            else {
-                Log("启动注册表项已成功禁用。"); // "Startup registry entry disabled successfully."
-            }
-        }
     }
 
-    // hKey is closed automatically by RAII destructor
+    if (status != ERROR_SUCCESS) {
+        // LOG_WARNING(L"Failed to open/create registry key: ", subKey, L". Error: ", status);
+        if (hKey) RegCloseKey(hKey); // Defensive, though hKey should be NULL on failure
+        return NULL;
+    }
+    return hKey;
+}
+
+void Registry::CloseKey(HKEY hKey) {
+    if (hKey != NULL) {
+        RegCloseKey(hKey);
+    }
+}
+
+bool Registry::ReadString(HKEY hKeyRoot, const std::wstring& subKey, const std::wstring& valueName, std::wstring& outValue) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_READ);
+    if (!hKey) {
+        return false;
+    }
+
+    DWORD dwType = 0;
+    DWORD dwSize = 0; // Size in bytes
+
+    // First, query for the size of the data
+    LSTATUS status = RegQueryValueExW(hKey, valueName.c_str(), NULL, &dwType, NULL, &dwSize);
+    if (status != ERROR_SUCCESS || dwType != REG_SZ) {
+        // LOG_WARNING(L"Failed to query registry value size or type mismatch for: ", valueName, L" in ", subKey, L". Error: ", status);
+        CloseKey(hKey);
+        return false;
+    }
+
+    if (dwSize == 0) { // Empty string
+        outValue = L"";
+        CloseKey(hKey);
+        return true;
+    }
+
+    // dwSize is in bytes. For wstring, we need to allocate characters.
+    // std::vector<wchar_t> buffer(dwSize / sizeof(wchar_t) + 1); // +1 for safety, though dwSize should include null terminator
+    outValue.resize(dwSize / sizeof(wchar_t));
+
+
+    status = RegQueryValueExW(hKey, valueName.c_str(), NULL, &dwType, reinterpret_cast<LPBYTE>(&outValue[0]), &dwSize);
+    CloseKey(hKey);
+
+    if (status != ERROR_SUCCESS) {
+        // LOG_WARNING(L"Failed to read registry string value: ", valueName, L" in ", subKey, L". Error: ", status);
+        outValue.clear();
+        return false;
+    }
+
+    // RegQueryValueExW (for REG_SZ) includes the null terminator in dwSize if the buffer is large enough.
+    // The wstring.resize might make the string one char too long if dwSize included the null.
+    // We need to ensure the string is correctly terminated.
+    // If dwSize was the size *including* the null terminator, then outValue.resize(dwSize / sizeof(wchar_t))
+    // might make a string that has a \0 in the middle and then garbage.
+    // A safer way for wstring:
+    outValue.resize(wcslen(outValue.c_str())); // Trim to actual length before any embedded nulls from over-allocation.
+
     return true;
 }
 
-// Reads the startup preference from the INI file and calls SetStartupRegistry accordingly.
-void ManageStartupSetting() {
-    Log("正在管理启动设置..."); // "Managing startup setting..."
+bool Registry::WriteString(HKEY hKeyRoot, const std::wstring& subKey, const std::wstring& valueName, const std::wstring& value) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_WRITE | KEY_CREATE_SUB_KEY, true); // Create key if it doesn't exist
+    if (!hKey) {
+        return false;
+    }
 
-    // Read the "RunOnStartup" value from the [System] section of the config file
-    // Default to 0 (disabled) if the key is not found or invalid.
-    int runOnStartup = GetPrivateProfileIntW(
-        SYSTEM_SECTION,       // Section name
-        RUN_ON_STARTUP_KEY,   // Key name
-        0,                    // Default value (0 = disabled)
-        CONFIG_PATH.c_str()   // Path to the INI file
+    // Value data must include the null terminator, so (value.length() + 1) * sizeof(wchar_t)
+    DWORD dwSize = (static_cast<DWORD>(value.length()) + 1) * sizeof(wchar_t);
+
+    LSTATUS status = RegSetValueExW(
+        hKey,
+        valueName.c_str(),
+        0, // Reserved
+        REG_SZ,
+        reinterpret_cast<const BYTE*>(value.c_str()),
+        dwSize
     );
+    CloseKey(hKey);
 
-    Log("从配置读取的 RunOnStartup 设置: " + std::to_string(runOnStartup)); // "RunOnStartup setting read from config: "
+    if (status != ERROR_SUCCESS) {
+        // LOG_ERROR(L"Failed to write registry string value: ", valueName, L" in ", subKey, L". Error: ", status);
+        return false;
+    }
+    return true;
+}
 
-    // Enable startup entry if the value is non-zero (typically 1)
-    bool enable = (runOnStartup != 0);
+bool Registry::ReadDword(HKEY hKeyRoot, const std::wstring& subKey, const std::wstring& valueName, DWORD& outValue) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_READ);
+    if (!hKey) {
+        return false;
+    }
 
-    // Call SetStartupRegistry to apply the setting
-    if (!SetStartupRegistry(enable)) {
-        // Log if applying the setting failed
-        Log("错误：应用启动注册表设置失败。"); // "Error: Failed to apply startup registry setting."
-        // Consider notifying the user if this fails persistently.
+    DWORD dwType = 0;
+    DWORD dwSize = sizeof(DWORD);
+    LSTATUS status = RegQueryValueExW(hKey, valueName.c_str(), NULL, &dwType, reinterpret_cast<LPBYTE>(&outValue), &dwSize);
+    CloseKey(hKey);
+
+    if (status != ERROR_SUCCESS || dwType != REG_DWORD) {
+        // LOG_WARNING(L"Failed to read registry DWORD value or type mismatch for: ", valueName, L" in ", subKey, L". Error: ", status);
+        return false;
+    }
+    return true;
+}
+
+bool Registry::WriteDword(HKEY hKeyRoot, const std::wstring& subKey, const std::wstring& valueName, DWORD value) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_WRITE | KEY_CREATE_SUB_KEY, true);
+    if (!hKey) {
+        return false;
+    }
+
+    LSTATUS status = RegSetValueExW(
+        hKey,
+        valueName.c_str(),
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value),
+        sizeof(DWORD)
+    );
+    CloseKey(hKey);
+
+    if (status != ERROR_SUCCESS) {
+        // LOG_ERROR(L"Failed to write registry DWORD value: ", valueName, L" in ", subKey, L". Error: ", status);
+        return false;
+    }
+    return true;
+}
+
+bool Registry::DeleteKey(HKEY hKeyRoot, const std::wstring& subKey, bool recursive) {
+    LSTATUS status;
+    if (recursive) {
+        // SHDeleteKeyW deletes a key and all its subkeys and values.
+        // It is available in shlwapi.dll.
+        status = SHDeleteKeyW(hKeyRoot, subKey.c_str());
     }
     else {
-        Log("启动注册表设置已根据配置成功应用。"); // "Startup registry setting applied successfully based on config."
+        // RegDeleteKeyW only deletes a key if it has no subkeys.
+        // For deleting a key that might have subkeys but you don't want to use SHDeleteKeyW,
+        // you would need to recursively enumerate and delete subkeys first.
+        status = RegDeleteKeyW(hKeyRoot, subKey.c_str());
     }
+
+    if (status != ERROR_SUCCESS) {
+        // ERROR_FILE_NOT_FOUND is common if the key doesn't exist, not necessarily an error to log loudly.
+        // if (status != ERROR_FILE_NOT_FOUND) {
+        //    LOG_WARNING(L"Failed to delete registry key: ", subKey, L". Error: ", status);
+        // }
+        return false;
+    }
+    return true;
+}
+
+
+bool Registry::DeleteValue(HKEY hKeyRoot, const std::wstring& subKey, const std::wstring& valueName) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_SET_VALUE); // KEY_SET_VALUE is required to delete a value
+    if (!hKey) {
+        return false;
+    }
+
+    LSTATUS status = RegDeleteValueW(hKey, valueName.c_str());
+    CloseKey(hKey);
+
+    if (status != ERROR_SUCCESS) {
+        // if (status != ERROR_FILE_NOT_FOUND) { // Value not found is not always an error
+        //    LOG_WARNING(L"Failed to delete registry value: ", valueName, L" in ", subKey, L". Error: ", status);
+        // }
+        return false;
+    }
+    return true;
+}
+
+bool Registry::KeyExists(HKEY hKeyRoot, const std::wstring& subKey) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_READ);
+    if (hKey) {
+        CloseKey(hKey);
+        return true;
+    }
+    return false;
+}
+
+bool Registry::ValueExists(HKEY hKeyRoot, const std::wstring& subKey, const std::wstring& valueName) {
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_READ);
+    if (!hKey) {
+        return false; // Key itself doesn't exist or cannot be opened
+    }
+
+    LSTATUS status = RegQueryValueExW(hKey, valueName.c_str(), NULL, NULL, NULL, NULL);
+    CloseKey(hKey);
+
+    return status == ERROR_SUCCESS;
+}
+
+bool Registry::EnumSubKeys(HKEY hKeyRoot, const std::wstring& subKey, std::vector<std::wstring>& outSubKeyNames) {
+    outSubKeyNames.clear();
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE);
+    if (!hKey) {
+        return false;
+    }
+
+    wchar_t    achKey[MAX_PATH]; // Buffer for subkey name
+    DWORD    cbName;             // Size of name string 
+    DWORD    cSubKeys = 0;       // Number of subkeys 
+
+    // Get the class name and the value count. 
+    RegQueryInfoKey(
+        hKey,                  // key handle 
+        NULL,                // buffer for class name 
+        NULL,                // size of class string 
+        NULL,                // reserved 
+        &cSubKeys,           // number of subkeys 
+        NULL,                // longest subkey size 
+        NULL,                // longest class string 
+        NULL,                // number of values for this key 
+        NULL,                // longest value name 
+        NULL,                // longest value data 
+        NULL,                // security descriptor 
+        NULL);               // last write time 
+
+    if (cSubKeys > 0) {
+        for (DWORD i = 0; i < cSubKeys; i++) {
+            cbName = MAX_PATH;
+            LSTATUS status = RegEnumKeyExW(hKey, i,
+                achKey,
+                &cbName,
+                NULL,
+                NULL,
+                NULL,
+                NULL);
+            if (status == ERROR_SUCCESS) {
+                outSubKeyNames.push_back(achKey);
+            }
+            else {
+                // LOG_WARNING(L"Failed to enumerate subkey at index ", i, L" for key ", subKey, L". Error: ", status);
+                // Decide if to continue or bail out
+            }
+        }
+    }
+    CloseKey(hKey);
+    return true; // Or return false if any RegEnumKeyExW failed
+}
+
+bool Registry::EnumValueNames(HKEY hKeyRoot, const std::wstring& subKey, std::vector<std::wstring>& outValueNames) {
+    outValueNames.clear();
+    HKEY hKey = OpenKey(hKeyRoot, subKey, KEY_QUERY_VALUE);
+    if (!hKey) {
+        return false;
+    }
+
+    wchar_t  achValue[MAX_PATH]; // Buffer for value name, MAX_VALUE_NAME from winnt.h is 16383
+    DWORD    cchValue = MAX_PATH; // Size of value name buffer
+
+    DWORD cValues;              // number of values for key 
+    RegQueryInfoKey(
+        hKey,                  // key handle 
+        NULL,                // buffer for class name 
+        NULL,                // size of class string 
+        NULL,                // reserved 
+        NULL,                // number of subkeys 
+        NULL,                // longest subkey size 
+        NULL,                // longest class string 
+        &cValues,            // number of values for this key 
+        NULL,                // longest value name 
+        NULL,                // longest value data 
+        NULL,                // security descriptor 
+        NULL);               // last write time 
+
+    if (cValues > 0) {
+        for (DWORD i = 0; i < cValues; i++) {
+            cchValue = MAX_PATH; // Reset buffer size for each call
+            achValue[0] = L'\0'; // Clear buffer
+            LSTATUS status = RegEnumValueW(hKey, i,
+                achValue,
+                &cchValue,
+                NULL, // Reserved
+                NULL, // Type
+                NULL, // Data
+                NULL  // Data size
+            );
+
+            if (status == ERROR_SUCCESS) {
+                outValueNames.push_back(achValue);
+            }
+            else if (status != ERROR_NO_MORE_ITEMS) { // ERROR_NO_MORE_ITEMS can happen if count changes
+                // LOG_WARNING(L"Failed to enumerate value name at index ", i, L" for key ", subKey, L". Error: ", status);
+            }
+        }
+    }
+    CloseKey(hKey);
+    return true;
 }

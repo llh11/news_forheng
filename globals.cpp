@@ -1,184 +1,51 @@
-// globals.cpp
-// Defines global variables declared in globals.h and implements RAII classes
-#include "globals.h" // Include header first
+#include "globals.h"
+#include "utils.h" // 假设 utils.h 中有获取路径的帮助函数
+#include <shlobj.h> // 用于 SHGetFolderPathW
 
-// Standard library includes needed for definitions here
-#include <Windows.h>
-#include <wininet.h> // Needed for HINTERNET and InternetCloseHandle
-#include <string>
-#include <vector>
-#include <mutex>
-#include <atomic>
-#include <deque>
-#include <limits> // Required for INVALID_HANDLE_VALUE comparison if not implicitly included
+// 初始化全局变量的定义
+std::wstring g_appName = L"NewsForHeng";      // 应用程序名称 (使用 L"" 定义宽字符串)
+std::wstring g_appVersion = L"1.0.0";         // 应用程序版本
+std::wstring g_configFilePath = L"";          // 配置文件路径，将在 InitializeGlobals 中设置
+std::wstring g_logFilePath = L"";             // 日志文件路径，将在 InitializeGlobals 中设置
+std::wstring g_appDataDir = L"";              // 应用程序数据目录
 
-// --- WinINet 用户代理 ---
-// Note: Consider making the version part dynamic if needed
-const wchar_t* const USER_AGENT = L"NewsSchedulerApp/2.1.1"; // Updated version to match constant below
+std::atomic<bool> g_isRunning(true);          // 程序启动时默认为运行状态
+bool g_debugMode = false;                     // 调试模式默认为关闭
 
-// --- 路径常量 ---
-// IMPORTANT: Hardcoding "D:\\news\\" is generally bad practice.
-// Consider using environment variables, registry, or known folders (like %APPDATA%).
-// For now, keeping the original path but adding a note.
-const std::wstring CONFIG_DIR = L"D:\\news\\"; // WARNING: Hardcoded path
-const std::wstring CONFIG_FILE_NAME = L"config.ini";
-const std::wstring LOG_FILE_NAME = L"scheduler.log";
-const std::wstring CONFIG_PATH = CONFIG_DIR + CONFIG_FILE_NAME;
-const std::wstring LOG_PATH = CONFIG_DIR + LOG_FILE_NAME;
-const std::wstring CONFIGURATOR_EXE_NAME = L"Configurator.exe";
-const std::wstring PENDING_UPDATE_INFO_PATH = CONFIG_DIR + L"update_pending.inf";
-const std::wstring IGNORED_UPDATE_VERSION_PATH = CONFIG_DIR + L"update_ignored.txt";
+HWND g_hMainWnd = NULL;                       // 主窗口句柄默认为 NULL
 
-// --- INI 文件常量 ---
-const wchar_t APP_SECTION[] = L"Settings"; // Section for application-specific settings
-const wchar_t NEWS_URL_KEY[] = L"NewsUrl";
-const wchar_t WEATHER_URL_KEY[] = L"WeatherUrl";
-const wchar_t NOON_SHUTDOWN_HOUR_KEY[] = L"NoonShutdownHour";
-const wchar_t NOON_SHUTDOWN_MINUTE_KEY[] = L"NoonShutdownMinute";
-const wchar_t EVENING_SHUTDOWN_HOUR_KEY[] = L"EveningShutdownHour";
-const wchar_t EVENING_SHUTDOWN_MINUTE_KEY[] = L"EveningShutdownMinute";
-const wchar_t SYSTEM_SECTION[] = L"System"; // Section for system-related settings
-const wchar_t DEVICE_ID_KEY[] = L"DeviceID";
-const wchar_t RUN_ON_STARTUP_KEY[] = L"RunOnStartup"; // Key for startup preference (e.g., "1" or "0")
+// int g_someGlobalSetting = 10;
 
-// --- 注册表常量 ---
-const wchar_t* const RUN_REGISTRY_KEY_PATH = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
-const wchar_t* const REGISTRY_VALUE_NAME = L"NewsSchedulerApp"; // Name of the value under the Run key
-
-// --- 自动更新配置 ---
-// Consider moving URLs to the config file for flexibility.
-const std::wstring UPDATE_SERVER_BASE_URL = L"http://news.lcez.fun"; // Base URL for the update server
-const std::wstring UPDATE_CHECK_URL = UPDATE_SERVER_BASE_URL + L"/api/upload.php?action=latest"; // URL to check for latest version info
-const std::wstring UPDATE_PING_URL = UPDATE_SERVER_BASE_URL + L"/api/upload.php?action=ping"; // URL to check server reachability
-const std::wstring CURRENT_VERSION = L"2.1.1"; // Current version of *this* application
-const int CHECK_UPDATE_INTERVAL = 3600; // Interval in seconds for checking updates (1 hour)
-const int CONNECT_TIMEOUT_MS = 15000; // Timeout for network connections in milliseconds (15 seconds)
-const int DOWNLOAD_TIMEOUT_MS = 60000; // Timeout for file downloads in milliseconds (60 seconds)
-// MAX_URL_LENGTH is defined as constexpr in globals.h, NO definition needed here.
-
-// --- 心跳配置 ---
-// Consider moving URLs to the config file.
-const std::wstring HEARTBEAT_API_URL = UPDATE_SERVER_BASE_URL + L"/api/heartbeat.php"; // URL for sending heartbeat pings
-const std::wstring STATUS_API_URL = UPDATE_SERVER_BASE_URL + L"/api/status.php";       // URL for potentially fetching status info
-const int HEARTBEAT_INTERVAL_SECONDS = 180; // Interval in seconds for sending heartbeats (3 minutes)
-
-// --- 全局状态 ---
-std::atomic_bool g_bRunning(true);                // Flag to signal threads to terminate
-std::mutex g_logMutex;                            // Mutex for thread-safe writing to the log file
-std::mutex g_logCacheMutex;                       // Mutex for thread-safe access to the log cache
-std::deque<std::wstring> g_logCache;              // In-memory cache for recent log messages (for UI display)
-HWND g_hWnd = nullptr;                            // Handle to the main application window
-HWND g_hProgressDlg = nullptr;                    // Handle to the modeless progress dialog
-HWND g_hLogEdit = nullptr;                        // Handle to the edit control displaying logs (if applicable)
-NOTIFYICONDATAW g_notifyIconData = { sizeof(NOTIFYICONDATAW) }; // Structure for the system tray icon (initialized size)
-std::atomic_bool g_bAutoUpdatePaused(false);      // Flag to pause/resume automatic update checks
-std::atomic_bool g_bCheckUpdateNow(false);        // Flag to trigger an immediate update check
-const int MAX_LOG_LINES_DISPLAY = 100;            // Maximum number of log lines to keep in the memory cache
-std::wstring g_deviceID = L"";                    // Global device ID, initialized by InitializeDeviceID()
-
-// --- RAII 类实现 ---
-
-// InternetHandle Implementation
-InternetHandle::InternetHandle() : m_handle(nullptr) {}
-InternetHandle::InternetHandle(HINTERNET h) : m_handle(h) {}
-InternetHandle::~InternetHandle() {
-    if (m_handle) {
-        InternetCloseHandle(m_handle);
-        m_handle = nullptr; // Good practice to null after closing
+// 初始化全局变量函数实现
+void InitializeGlobals() {
+    // 获取应用程序数据目录 (例如 C:\Users\YourUser\AppData\Roaming\NewsForHeng)
+    // 这是存放配置文件和日志文件的推荐位置
+    wchar_t szPath[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, szPath))) {
+        g_appDataDir = std::wstring(szPath) + L"\\" + g_appName;
+        // 如果目录不存在，则创建它
+        if (!DirectoryExists(g_appDataDir)) { // 假设 DirectoryExists 在 utils.h/cpp 中
+            CreateDirectoryRecursive(g_appDataDir); // 假设 CreateDirectoryRecursive 在 utils.h/cpp 中
+        }
     }
-}
-InternetHandle::InternetHandle(InternetHandle&& other) noexcept : m_handle(other.m_handle) {
-    other.m_handle = nullptr; // Take ownership, leave other empty
-}
-InternetHandle& InternetHandle::operator=(InternetHandle&& other) noexcept {
-    if (this != &other) {
-        if (m_handle) { InternetCloseHandle(m_handle); } // Close existing handle
-        m_handle = other.m_handle;                       // Take ownership
-        other.m_handle = nullptr;                        // Leave other empty
+    else {
+        // 如果获取 AppData 失败，则退回到程序当前目录
+        // 这不是最佳实践，但作为备选方案
+        wchar_t currentDir[MAX_PATH];
+        GetCurrentDirectoryW(MAX_PATH, currentDir);
+        g_appDataDir = currentDir;
+        // 也可以考虑记录一个错误或警告
     }
-    return *this;
-}
-HINTERNET InternetHandle::get() const { return m_handle; }
-InternetHandle::operator bool() const { return m_handle != nullptr; }
-HINTERNET InternetHandle::release() {
-    HINTERNET temp = m_handle;
-    m_handle = nullptr; // Release ownership
-    return temp;
-}
-InternetHandle& InternetHandle::operator=(HINTERNET h) {
-    if (m_handle && m_handle != h) { // Avoid self-assignment and closing same handle
-        InternetCloseHandle(m_handle);
-    }
-    m_handle = h;
-    return *this;
+
+    g_configFilePath = g_appDataDir + L"\\config.ini";
+    g_logFilePath = g_appDataDir + L"\\app.log";
+
+    // 可以在此处从配置文件加载 g_debugMode 等设置
+    // LoadConfig(); // 假设有这样一个函数
 }
 
-// FileHandle Implementation
-FileHandle::FileHandle() : m_handle(INVALID_HANDLE_VALUE) {}
-FileHandle::FileHandle(HANDLE h) : m_handle(h) {}
-FileHandle::~FileHandle() {
-    if (m_handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(m_handle);
-        m_handle = INVALID_HANDLE_VALUE; // Good practice
-    }
-}
-FileHandle::FileHandle(FileHandle&& other) noexcept : m_handle(other.m_handle) {
-    other.m_handle = INVALID_HANDLE_VALUE;
-}
-FileHandle& FileHandle::operator=(FileHandle&& other) noexcept {
-    if (this != &other) {
-        if (m_handle != INVALID_HANDLE_VALUE) { CloseHandle(m_handle); }
-        m_handle = other.m_handle;
-        other.m_handle = INVALID_HANDLE_VALUE;
-    }
-    return *this;
-}
-HANDLE FileHandle::get() const { return m_handle; }
-FileHandle::operator bool() const { return m_handle != INVALID_HANDLE_VALUE; }
-HANDLE FileHandle::release() {
-    HANDLE temp = m_handle;
-    m_handle = INVALID_HANDLE_VALUE;
-    return temp;
-}
-FileHandle& FileHandle::operator=(HANDLE h) {
-    if (m_handle != INVALID_HANDLE_VALUE && m_handle != h) {
-        CloseHandle(m_handle);
-    }
-    m_handle = h;
-    return *this;
-}
-
-// RegKeyHandle Implementation
-RegKeyHandle::RegKeyHandle() : m_hKey(NULL) {}
-RegKeyHandle::RegKeyHandle(HKEY h) : m_hKey(h) {}
-RegKeyHandle::~RegKeyHandle() {
-    if (m_hKey) {
-        RegCloseKey(m_hKey);
-        m_hKey = NULL; // Good practice
-    }
-}
-RegKeyHandle::RegKeyHandle(RegKeyHandle&& other) noexcept : m_hKey(other.m_hKey) {
-    other.m_hKey = NULL;
-}
-RegKeyHandle& RegKeyHandle::operator=(RegKeyHandle&& other) noexcept {
-    if (this != &other) {
-        if (m_hKey) { RegCloseKey(m_hKey); }
-        m_hKey = other.m_hKey;
-        other.m_hKey = NULL;
-    }
-    return *this;
-}
-HKEY RegKeyHandle::get() const { return m_hKey; }
-RegKeyHandle::operator bool() const { return m_hKey != NULL; }
-HKEY RegKeyHandle::release() {
-    HKEY temp = m_hKey;
-    m_hKey = NULL;
-    return temp;
-}
-RegKeyHandle& RegKeyHandle::operator=(HKEY h) {
-    if (m_hKey && m_hKey != h) {
-        RegCloseKey(m_hKey);
-    }
-    m_hKey = h;
-    return *this;
+void CleanupGlobals() {
+    // 如果有动态分配的全局资源，在此处释放
+    // 例如：delete g_someGlobalPointer;
+    // g_someGlobalPointer = nullptr;
 }

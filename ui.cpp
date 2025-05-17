@@ -1,107 +1,236 @@
-// ui.cpp
-// Implements user interface functions like tray icon and progress dialog.
-#include "ui.h"      // Function declarations for this file
-#include "globals.h" // Access to global handles (g_hWnd, g_hProgressDlg), constants (WM_APP_*, ID_*, etc.), state (g_bAutoUpdatePaused, g_notifyIconData)
-#include "log.h"     // For Log function
+#include "ui.h"
+#include "globals.h" 
+#include "log.h"
+// #include "resource.h" // C1083: If you don't have a resource.h or don't use resources, comment this out or remove it.
+                       // For a typical VS project, if you add resources (icons, menus via designer), it's auto-generated.
+                       // If not, it won't exist. For now, I'll comment it out.
+                       // If you have one, make sure it's in the project's include paths.
 
-#include <Windows.h>
-#include <commctrl.h> // For progress bar messages (PBM_*) and TaskDialog constants/functions if needed here
-#include <shellapi.h> // For NOTIFYICONDATAW, Shell_NotifyIconW
-#include <string>
-#include <system_error> // For std::system_category
-#include <algorithm>    // For std::max, std::min
-#include <new>          // For std::nothrow
+// 全局/静态变量，用于存储控件句柄 (示例)
+static HWND g_hStatusBar = NULL;
+static HWND g_hUpdateButton = NULL;
 
-// (AddTrayIcon - unchanged from previous fix)
-void AddTrayIcon(HWND hWnd) {
-    Log("正在添加托盘图标..."); // "Adding tray icon..."
-    ZeroMemory(&g_notifyIconData, sizeof(NOTIFYICONDATAW)); g_notifyIconData.cbSize = sizeof(NOTIFYICONDATAW); g_notifyIconData.hWnd = hWnd; g_notifyIconData.uID = 1; g_notifyIconData.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP; g_notifyIconData.uCallbackMessage = WM_APP_TRAY_MSG;
-    HICON hIcon = LoadIcon(NULL, IDI_APPLICATION); if (!hIcon) { DWORD error = GetLastError(); Log("错误：加载默认托盘图标失败。LoadIcon 错误代码: " + std::to_string(error)); g_notifyIconData.hIcon = NULL; }
-    else { g_notifyIconData.hIcon = hIcon; } // "Error: Failed to load default tray icon. LoadIcon Error Code: "
-    wcsncpy_s(g_notifyIconData.szTip, std::size(g_notifyIconData.szTip), L"新闻联播调度器", _TRUNCATE); // "News Broadcast Scheduler"
-    if (!Shell_NotifyIconW(NIM_ADD, &g_notifyIconData)) {
-        DWORD error = GetLastError(); if (error == ERROR_TIMEOUT) { Log("Shell_NotifyIconW(NIM_ADD) 超时，使用 NIM_MODIFY 重试..."); Sleep(100); if (!Shell_NotifyIconW(NIM_MODIFY, &g_notifyIconData)) { error = GetLastError(); Log("错误：超时后添加/修改托盘图标失败。错误代码: " + std::to_string(error)); } else { Log("初始超时后成功修改托盘图标。"); } } // "timed out, retrying with NIM_MODIFY..." "Error: Failed to add/modify tray icon after timeout. Error Code: " "Tray icon modified successfully after initial timeout."
-        else { Log("错误：添加托盘图标失败。错误代码: " + std::to_string(error)); } // "Error: Failed to add tray icon. Error Code: "
-    }
-    else { g_notifyIconData.uVersion = NOTIFYICON_VERSION_4; Shell_NotifyIconW(NIM_SETVERSION, &g_notifyIconData); Log("托盘图标添加成功。"); } // "Tray icon added successfully."
-}
 
-// (RemoveTrayIcon - unchanged from previous fix)
-void RemoveTrayIcon() {
-    if (g_notifyIconData.hWnd) { Log("正在移除托盘图标..."); if (!Shell_NotifyIconW(NIM_DELETE, &g_notifyIconData)) { DWORD error = GetLastError(); if (IsWindow(g_notifyIconData.hWnd)) { Log("错误：删除托盘图标失败。错误代码: " + std::to_string(error)); } } else { Log("托盘图标删除成功。"); } g_notifyIconData.hWnd = NULL; g_notifyIconData.hIcon = NULL; } // "Removing tray icon..." "Error: Failed to delete tray icon. Error Code: " "Tray icon deleted successfully."
-}
+// 回调函数定义
+std::function<void()> UI::onCheckForUpdatesClicked = nullptr;
+std::function<bool()> UI::onExitRequested = nullptr;
 
-// (ShowTrayMenu - unchanged from previous fix)
-void ShowTrayMenu(HWND hWnd) {
-    POINT pt; if (!GetCursorPos(&pt)) { DWORD error = GetLastError(); Log("错误：无法获取光标位置以显示托盘菜单。错误代码: " + std::to_string(error)); return; } // "Error: Cannot get cursor position for tray menu. Error Code: "
-    HMENU hMenu = CreatePopupMenu(); if (!hMenu) { DWORD error = GetLastError(); Log("错误：创建托盘弹出菜单失败。错误代码: " + std::to_string(error)); return; } // "Error: Failed to create tray popup menu. Error Code: "
-    InsertMenuW(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_TRAY_OPEN_LOG_COMMAND, L"打开日志文件(&L)"); InsertMenuW(hMenu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr); InsertMenuW(hMenu, 2, MF_BYPOSITION | MF_STRING, ID_TRAY_CHECK_NOW_COMMAND, L"立即检查更新(&C)"); std::wstring pauseResumeText = g_bAutoUpdatePaused.load() ? L"恢复自动更新(&R)" : L"暂停自动更新(&P)"; InsertMenuW(hMenu, 3, MF_BYPOSITION | MF_STRING, ID_TRAY_PAUSE_RESUME_COMMAND, pauseResumeText.c_str()); InsertMenuW(hMenu, 4, MF_BYPOSITION | MF_SEPARATOR, 0, nullptr); InsertMenuW(hMenu, 5, MF_BYPOSITION | MF_STRING, ID_TRAY_EXIT_COMMAND, L"退出程序(&X)"); // "Open Log File (&L)" "Check Update Now (&C)" "Resume Auto Update (&R)" "Pause Auto Update (&P)" "Exit Application (&X)"
-    SetForegroundWindow(hWnd); BOOL cmd = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_VERPOSANIMATION, pt.x, pt.y, 0, hWnd, NULL); PostMessage(hWnd, WM_NULL, 0, 0);
-    if (!DestroyMenu(hMenu)) { DWORD error = GetLastError(); Log("警告：销毁托盘菜单失败。错误代码: " + std::to_string(error)); } // "Warning: Failed to destroy tray menu. Error Code: "
-}
 
-// --- Progress Dialog Procedure ---
-INT_PTR CALLBACK ProgressDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK UI::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-    case WM_INITDIALOG:
-        SendDlgItemMessageW(hDlg, IDC_PROGRESS_BAR, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
-        SendDlgItemMessageW(hDlg, IDC_PROGRESS_BAR, PBM_SETPOS, 0, 0);
-        SetDlgItemTextW(hDlg, IDC_PROGRESS_TEXT, L"准备中..."); // "Preparing..."
-        Log("进度对话框已初始化。"); // "Progress dialog initialized."
-        return (INT_PTR)TRUE;
+    case WM_CREATE:
+        // CreateControls should be called here as hWnd is valid.
+        CreateControls(hWnd, ((LPCREATESTRUCT)lParam)->hInstance);
+        LOG_INFO(L"Main window created (WM_CREATE). Controls initialized.");
+        break;
 
-    case WM_APP_UPDATE_PROGRESS: {
-        int percent = static_cast<int>(wParam);
-        wchar_t* statusText = reinterpret_cast<wchar_t*>(lParam);
-
-        // <<< FIX C2589/C2059: Use parentheses around std::max/min
-        percent = (std::max)(0, (std::min)(100, percent));
-
-        SendDlgItemMessageW(hDlg, IDC_PROGRESS_BAR, PBM_SETPOS, percent, 0);
-        if (statusText) {
-            SetDlgItemTextW(hDlg, IDC_PROGRESS_TEXT, statusText);
+    case WM_COMMAND: {
+        int wmId = LOWORD(wParam);
+        switch (wmId) {
+        case IDC_BUTTON_UPDATE:
+            if (HIWORD(wParam) == BN_CLICKED) {
+                LOG_INFO(L"Update button clicked.");
+                if (onCheckForUpdatesClicked) {
+                    onCheckForUpdatesClicked();
+                }
+                else {
+                    MessageBoxW(hWnd, L"Update function not implemented.", L"Info", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+            break;
+            // Example Menu items (if you add a menu resource and uncomment resource.h)
+            // #define IDM_ABOUT 101 // Define these if not in resource.h
+            // #define IDM_EXIT  102
+            // case IDM_ABOUT: 
+            //     MessageBoxW(hWnd, L"NewsForHeng App v1.0", L"About", MB_OK | MB_ICONINFORMATION);
+            //     break;
+            // case IDM_EXIT: 
+            //     DestroyWindow(hWnd);
+            //     break;
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
         }
-        else {
-            SetDlgItemTextW(hDlg, IDC_PROGRESS_TEXT, L"");
-        }
-        if (statusText) {
-            delete[] statusText; // Memory allocated in PostProgressUpdate is deleted here
-            statusText = nullptr;
-        }
-        return (INT_PTR)TRUE;
     }
-    case WM_APP_SHOW_PROGRESS_DLG:
-        Log("进度对话框：收到 WM_APP_SHOW_PROGRESS_DLG。"); // "Progress Dialog: Received WM_APP_SHOW_PROGRESS_DLG."
-        ShowWindow(hDlg, SW_SHOWNORMAL);
-        SetForegroundWindow(hDlg);
-        return (INT_PTR)TRUE;
+                   break;
 
-    case WM_APP_HIDE_PROGRESS_DLG:
-        Log("进度对话框：收到 WM_APP_HIDE_PROGRESS_DLG。"); // "Progress Dialog: Received WM_APP_HIDE_PROGRESS_DLG."
-        ShowWindow(hDlg, SW_HIDE);
-        return (INT_PTR)TRUE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        // Example: Draw some text if you want.
+        // LPCWSTR text = L"Welcome to NewsForHeng!";
+        // TextOutW(hdc, 10, 50, text, wcslen(text));
+        EndPaint(hWnd, &ps);
+    }
+                 break;
+
+    case WM_SIZE: {
+        int width = LOWORD(lParam);
+        int height = HIWORD(lParam);
+        if (g_hStatusBar) {
+            // Move status bar to bottom, full width
+            MoveWindow(g_hStatusBar, 0, height - 20, width, 20, TRUE);
+        }
+        if (g_hUpdateButton) {
+            // Example: Keep button at top-left
+            // MoveWindow(g_hUpdateButton, 10, 10, 120, 30, TRUE); 
+        }
+        break;
+    }
 
     case WM_CLOSE:
-        Log("进度对话框收到 WM_CLOSE（已忽略）。"); // "Progress dialog WM_CLOSE received (ignored)."
-        return (INT_PTR)TRUE;
+        LOG_INFO(L"WM_CLOSE received. Requesting exit confirmation.");
+        if (onExitRequested) {
+            if (onExitRequested()) {
+                LOG_INFO(L"Exit approved by callback. Destroying window.");
+                DestroyWindow(hWnd);
+            }
+            else {
+                LOG_INFO(L"Exit denied by callback.");
+            }
+        }
+        else {
+            if (MessageBoxW(hWnd, L"Are you sure you want to exit?", g_appName.c_str(), MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                LOG_INFO(L"User confirmed exit. Destroying window.");
+                DestroyWindow(hWnd);
+            }
+            else {
+                LOG_INFO(L"User cancelled exit.");
+            }
+        }
+        return 0;
 
     case WM_DESTROY:
-        Log("进度对话框收到 WM_DESTROY。"); // "Progress dialog WM_DESTROY received."
-        return (INT_PTR)TRUE;
+        LOG_INFO(L"Main window destroyed (WM_DESTROY). Posting quit message.");
+        PostQuitMessage(0);
+        break;
+
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
     }
-    return (INT_PTR)FALSE;
+    return 0;
 }
 
-// --- Helper Function Definition ---
-// (PostProgressUpdate - unchanged from previous fix)
-void PostProgressUpdate(HWND hProgressWnd, int percent, const std::wstring& status) {
-    if (!hProgressWnd || !IsWindow(hProgressWnd)) return;
-    wchar_t* msgCopy = new (std::nothrow) wchar_t[status.length() + 1];
-    if (msgCopy) {
-        wcscpy_s(msgCopy, status.length() + 1, status.c_str());
-        if (!PostMessageW(hProgressWnd, WM_APP_UPDATE_PROGRESS, static_cast<WPARAM>(percent), reinterpret_cast<LPARAM>(msgCopy))) {
-            DWORD error = GetLastError(); Log("错误：向进度对话框发送 WM_APP_UPDATE_PROGRESS 失败。错误代码: " + std::to_string(error)); delete[] msgCopy; // "Error: Failed to PostMessage WM_APP_UPDATE_PROGRESS to progress dialog. Error code: "
+HWND UI::CreateMainWindow(
+    HINSTANCE hInstance,
+    int nCmdShow,
+    const std::wstring& windowTitle,
+    int width,
+    int height)
+{
+    const wchar_t CLASS_NAME[] = L"NewsForHengWindowClass";
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = UI::WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    // wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_YOUR_ICON)); // If you have an icon in resource.rc
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION); // Default application icon
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    // wc.lpszMenuName = MAKEINTRESOURCE(IDC_YOUR_MENU); // If you have a menu in resource.rc
+
+    if (!RegisterClassW(&wc)) {
+        LOG_FATAL(L"Failed to register window class. Error: ", GetLastError());
+        MessageBoxW(NULL, L"Window Registration Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
+        return NULL;
+    }
+
+    g_hMainWnd = CreateWindowExW(
+        0,
+        CLASS_NAME,
+        windowTitle.c_str(),
+        WS_OVERLAPPEDWINDOW,
+
+        CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+
+        NULL,
+        NULL,       // No menu by default, can be added via WNDCLASS or SetMenu
+        hInstance,
+        NULL
+    );
+
+    if (g_hMainWnd == NULL) {
+        LOG_FATAL(L"Failed to create main window. Error: ", GetLastError());
+        MessageBoxW(NULL, L"Window Creation Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
+        return NULL;
+    }
+
+    // Controls are now created in WM_CREATE of WndProc
+
+    ShowWindow(g_hMainWnd, nCmdShow);
+    UpdateWindow(g_hMainWnd);
+
+    LOG_INFO(L"Main window created and shown successfully.");
+    return g_hMainWnd;
+}
+
+int UI::RunMessageLoop() {
+    MSG msg = {};
+    BOOL bRet;
+    while ((bRet = GetMessage(&msg, NULL, 0, 0)) != 0) {
+        if (bRet == -1) {
+            LOG_ERROR(L"Error in GetMessage. Error code: ", GetLastError());
+            return -1;
+        }
+        else {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
         }
     }
-    else { Log("错误：为进度消息分配内存失败。"); } // "Error: Failed to allocate memory for progress message."
+    LOG_INFO(L"Message loop terminated. Exit code: ", (int)msg.wParam);
+    return (int)msg.wParam;
 }
+
+void UI::CreateControls(HWND hWndParent, HINSTANCE hInstance) {
+    int buttonWidth = 120;
+    int buttonHeight = 30;
+    int margin = 10;
+
+    g_hUpdateButton = CreateWindowW(
+        L"BUTTON",
+        L"Check for Updates",
+        WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON, // Changed BS_DEFPUSHBUTTON to BS_PUSHBUTTON
+        margin,
+        margin,
+        buttonWidth,
+        buttonHeight,
+        hWndParent,
+        (HMENU)IDC_BUTTON_UPDATE,
+        hInstance,
+        NULL);
+
+    if (!g_hUpdateButton) {
+        LOG_ERROR(L"Failed to create update button. Error: ", GetLastError());
+    }
+
+    RECT rcParent;
+    GetClientRect(hWndParent, &rcParent);
+    int statusHeight = 20;
+
+    g_hStatusBar = CreateWindowW(
+        L"STATIC",
+        L"Ready",
+        WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+        0, rcParent.bottom - statusHeight,
+        rcParent.right, statusHeight,
+        hWndParent,
+        (HMENU)IDC_STATUS_TEXT,
+        hInstance,
+        NULL
+    );
+    if (!g_hStatusBar) {
+        LOG_ERROR(L"Failed to create status text. Error: ", GetLastError());
+    }
+}
+
+void UI::UpdateStatusText(const std::wstring& newStatus) {
+    if (g_hStatusBar) {
+        SetWindowTextW(g_hStatusBar, newStatus.c_str());
+    }
+    else {
+        // This might be called before g_hStatusBar is created if PerformBackgroundUpdateCheck is called too early
+        LOG_WARNING(L"Attempted to update status text, but status bar handle is null. Status: ", newStatus.c_str());
+    }
+}
+
+ // namespace UI
